@@ -1,0 +1,60 @@
+---
+- name: Copy SSL certificate
+  copy:
+    src: "{{ item }}"
+    dest: "/etc/ssl/{{ item }}"
+    owner: root
+    group: root
+    mode: "{{ '0600' if item.endswith('.key') else '0644' }}"
+  loop:
+        - ssl.com.key
+        - ssl.com.pem
+
+- name: Check if proxy configuration file exists
+  stat:
+    path: "{{ data_file }}"
+  register: proxy_config_stat
+
+- name: Create default proxy configuration file if missing
+  template:
+    src: proxy_config.sh.j2
+    dest: "{{ data_file }}"
+    mode: '0755'
+    owner: ubuntu
+    group: ubuntu
+  when: not proxy_config_stat.stat.exists
+
+- name: Read proxy configuration file
+  slurp:
+    src: "{{ data_file }}"
+  register: proxy_config
+
+- name: Set backend and frontend IPs
+  set_fact:
+    backend_private_ip: "{{ proxy_config.content | b64decode | regex_search('backend_private_ip=([0-9.]+)', '\\1') | first }}"
+    frontend_private_ip: "{{ proxy_config.content | b64decode | regex_search('frontend_private_ip=([0-9.]+)', '\\1') | first }}"
+
+- name: Create Nginx reverse proxy configuration
+  template:
+    src: reverse-proxy.conf.j2
+    dest: /etc/nginx/sites-available/reverse-proxy
+
+- name: Create symbolic link for reverse proxy configuration
+  file:
+    src: /etc/nginx/sites-available/reverse-proxy
+    dest: /etc/nginx/sites-enabled/reverse-proxy
+    state: link
+
+- name: Remove default Nginx configuration
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/nginx/sites-enabled/default
+    - /etc/nginx/sites-available/default
+  become: yes
+
+- name: Reload Nginx service
+  systemd:
+    name: nginx
+    state: reloaded

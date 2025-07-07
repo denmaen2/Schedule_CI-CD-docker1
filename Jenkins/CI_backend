@@ -1,0 +1,224 @@
+pipeline {
+    agent any
+    
+    environment {
+        BUILD_VERSION = "${env.BUILD_NUMBER}"
+        DOCKER_REGISTRY = 'your-registry.com'
+        BACKEND_IMAGE = "${DOCKER_REGISTRY}/class-schedule/backend"
+        SONAR_PROJECT_KEY = "class-schedule-backend"
+        AWS_REGION = 'us-east-1'
+        ECR_REGISTRY = '394094767544.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_IMAGE = '394094767544.dkr.ecr.us-east-1.amazonaws.com/backend-app'
+        REACT_APP_API_BASE_URL = "DOMAIN_TOCKEN"
+    }
+    
+    tools {
+        jdk 'Java11'
+        gradle 'gradle'
+        git 'Default'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'github-cred', url: 'https://github.com/denmaen2/Schedule_with_docker.git'
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                }
+            }
+        }
+        
+        stage('Setup SonarQube') {
+            steps {
+                script {
+                    def sonarPort = sh(
+                        script: '''
+                            SONAR_PORT=9000
+                            while netstat -ln 2>/dev/null | grep -q ":$SONAR_PORT "; do
+                                SONAR_PORT=$((SONAR_PORT + 1))
+                            done
+                            echo $SONAR_PORT
+                        ''',
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.SONAR_URL = "http://localhost:${sonarPort}"
+                    
+                    sh """
+                        docker stop sonarqube-${BUILD_NUMBER} sonar-postgres-${BUILD_NUMBER} 2>/dev/null || true
+                        docker rm sonarqube-${BUILD_NUMBER} sonar-postgres-${BUILD_NUMBER} 2>/dev/null || true
+                        docker network rm sonar-network-${BUILD_NUMBER} 2>/dev/null || true
+                        
+                        docker network create sonar-network-${BUILD_NUMBER}
+                        
+                        docker run -d --name sonar-postgres-${BUILD_NUMBER} --network sonar-network-${BUILD_NUMBER} \
+                            -e POSTGRES_USER=sonar -e POSTGRES_PASSWORD=sonar -e POSTGRES_DB=sonar \
+                            postgres:13
+                        
+                        sleep 30
+                        
+                        docker run -d --name sonarqube-${BUILD_NUMBER} --network sonar-network-${BUILD_NUMBER} \
+                            -p ${sonarPort}:9000 \
+                            -e SONAR_JDBC_URL=jdbc:postgresql://sonar-postgres-${BUILD_NUMBER}:5432/sonar \
+                            -e SONAR_JDBC_USERNAME=sonar \
+                            -e SONAR_JDBC_PASSWORD=sonar \
+                            -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
+                            sonarqube:9.9-community
+                        
+                        sleep 60
+                    """
+                    
+                    // Wait for SonarQube and configure
+                    sh """
+                        for i in {1..30}; do
+                            if curl -s "${env.SONAR_URL}/api/system/status" | grep -q '"status":"UP"'; then
+                                break
+                            fi
+                            sleep 10
+                        done
+                        
+                        curl -X POST -u admin:admin "${env.SONAR_URL}/api/users/change_password" \
+                            -d "login=admin&password=admin123&previousPassword=admin" || true
+                        
+                        curl -X POST -u admin:admin123 "${env.SONAR_URL}/api/projects/create" \
+                            -d "name=Class Schedule Backend&project=${SONAR_PROJECT_KEY}" || true
+                    """
+                    
+                    def tokenResponse = sh(
+                        script: """
+                            curl -s -X POST -u admin:admin123 "${env.SONAR_URL}/api/user_tokens/generate" \
+                                -d "name=jenkins-backend-${BUILD_NUMBER}"
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    def token = sh(
+                        script: "echo '${tokenResponse}' | grep -o '\"token\":\"[^\"]*\"' | cut -d'\"' -f4",
+                        returnStdout: true
+                    ).trim()
+                    
+                    env.SONAR_TOKEN = token
+                }
+            }
+        }
+        
+        stage('Build & Test') {
+            steps {
+                dir('backend/backend') {
+                    sh '''
+                        gradle clean build
+                        gradle test
+                        gradle jacocoTestReport
+                        
+                        # Extract WAR file to create ROOT directory
+                        mkdir -p ROOT
+                        cd ROOT
+                        jar -xf ../build/libs/*.war
+                        
+                        # Move the ROOT directory to the Docker build context
+                        mv ../ROOT ../../ROOT
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit testResults: 'backend/backend/build/test-results/test/*.xml', allowEmptyResults: true
+                    
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'backend/backend/build/reports/tests/test',
+                        reportFiles: 'index.html',
+                        reportName: 'Test Report'
+                    ])
+                    
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'backend/backend/build/reports/jacoco/test/html',
+                        reportFiles: 'index.html',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                dir('backend/backend') {
+                    sh """
+                        gradle sonarqube \
+                            -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                            -Dsonar.projectName="Class Schedule Backend" \
+                            -Dsonar.projectVersion=${BUILD_VERSION} \
+                            -Dsonar.sources=src/main/java \
+                            -Dsonar.tests=src/test/java \
+                            -Dsonar.java.binaries=build/classes/java/main \
+                            -Dsonar.java.test.binaries=build/classes/java/test \
+                            -Dsonar.java.source=11 \
+                            -Dsonar.java.target=11 \
+                            -Dsonar.java.libraries="" \
+                            -Dsonar.java.coveragePlugin=jacoco \
+                            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml \
+                            -Dsonar.host.url="${env.SONAR_URL}" \
+                            -Dsonar.token="${env.SONAR_TOKEN}"
+                    """
+                }
+            }
+        }
+        
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    docker build -t ${BACKEND_IMAGE}:${BUILD_VERSION} -f backend/Dockerfile ./backend
+                    docker tag ${BACKEND_IMAGE}:${BUILD_VERSION} ${BACKEND_IMAGE}:latest
+                    
+                    # Also tag for ECR
+                    docker tag ${BACKEND_IMAGE}:${BUILD_VERSION} ${ECR_IMAGE}:${BUILD_VERSION}
+                    docker tag ${BACKEND_IMAGE}:${BUILD_VERSION} ${ECR_IMAGE}:latest
+                '''
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-ecr-credentials']
+                ]) {
+                    sh '''
+                        # Get ECR login token and login to Docker
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        
+                        # Push images to ECR
+                        docker push ${ECR_IMAGE}:${BUILD_VERSION}
+                        docker push ${ECR_IMAGE}:latest
+                        
+                        echo "Successfully pushed images to ECR:"
+                        echo "- ${ECR_IMAGE}:${BUILD_VERSION}"
+                        echo "- ${ECR_IMAGE}:latest"
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            sh """
+                docker stop sonarqube-${BUILD_NUMBER} sonar-postgres-${BUILD_NUMBER} 2>/dev/null || true
+                docker rm sonarqube-${BUILD_NUMBER} sonar-postgres-${BUILD_NUMBER} 2>/dev/null || true
+                docker network rm sonar-network-${BUILD_NUMBER} 2>/dev/null || true
+            """
+            cleanWs()
+        }
+        success {
+            script {
+                if (env.SONAR_URL) {
+                    echo "SonarQube Results: ${env.SONAR_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                }
+            }
+        }
+    }
+}

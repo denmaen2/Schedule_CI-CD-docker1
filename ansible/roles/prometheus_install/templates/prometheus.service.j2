@@ -1,0 +1,23 @@
+# templates/prometheus.service.j2
+[Unit]
+Description=Prometheus Monitoring System
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User={{ prometheus_user }}
+Group={{ prometheus_group }}
+Type=simple
+ExecStart={{ prometheus_install_dir }}/prometheus \
+  --config.file={{ prometheus_config_dir }}/prometheus.yml \
+  --storage.tsdb.path={{ prometheus_data_dir }} \
+  --web.listen-address="{{ prometheus_web_listen_address }}" \
+  --web.console.templates={{ prometheus_config_dir }}/consoles \
+  --web.console.libraries={{ prometheus_config_dir }}/console_libraries \
+  --log.level={{ prometheus_log_level }} \
+  --storage.tsdb.retention.time={{ prometheus_retention_time }}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

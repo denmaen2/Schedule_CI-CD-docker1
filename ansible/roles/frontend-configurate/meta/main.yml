@@ -1,0 +1,21 @@
+---
+galaxy_info:
+  author: "DevOps Team"
+  description: "Deploy frontend application from ECR using Docker"
+  company: "Your Company"
+  license: "MIT"
+  min_ansible_version: "2.9"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+  galaxy_tags:
+    - docker
+    - frontend
+    - ecr
+    - aws
+
+dependencies:
+  - role: s3_deployment
+    when: use_s3_deployment | default(false)

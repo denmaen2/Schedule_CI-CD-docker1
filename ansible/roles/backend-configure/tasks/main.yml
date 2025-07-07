@@ -1,0 +1,43 @@
+---
+- name: Login to ECR using AWS CLI
+  shell: |
+    aws ecr get-login-password --region {{ aws_region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+  args:
+    executable: /bin/bash
+  become: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+- name: Pull backend image from ECR
+  docker_image:
+    name: "{{ ecr_registry }}/{{ ecr_repository }}:{{ ecr_tag }}"
+    source: pull
+    force_source: yes
+  become: true
+
+- name: Set container environment variables
+  set_fact:
+    container_env:
+      ENDPOINT_TOCKEN_POSTGRES: "{{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') | default('') }}"
+      DATABASE_TOCKEN: "{{ lookup('env', 'DATABASE_TOCKEN') | default('') }}"
+      USERNAME_TOCKEN: "{{ lookup('env', 'USERNAME_TOCKEN') | default('') }}"
+      USERPASSWORD_TOCKEN: "{{ lookup('env', 'USERPASSWORD_TOCKEN') | default('') }}"
+      ENDPOINT_TOCKEN_REDIS: "{{ lookup('env', 'ENDPOINT_TOCKEN_REDIS') | default('') }}"
+
+- name: Run backend Docker container
+  docker_container:
+    name: "{{ container_name }}"
+    image: "{{ ecr_registry }}/{{ ecr_repository }}:{{ ecr_tag }}"
+    state: started
+    restart_policy: "{{ restart_policy }}"
+    published_ports:
+      - "{{ host_port }}:{{ container_port }}"
+    env: "{{ container_env }}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{{ container_port }}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+  become: true

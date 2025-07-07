@@ -1,0 +1,229 @@
+---
+- name: Install PostgreSQL client if not present
+  apt:
+    name: postgresql-client
+    state: present
+    update_cache: true
+  become: true
+
+# Validate AWS credentials before proceeding
+- name: Test AWS credentials
+  shell: aws sts get-caller-identity --region {{ json_vars.ansible.s3.aws_region }}
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+  register: aws_test
+  failed_when: aws_test.rc != 0
+
+- name: Find S3 bucket with database dumps
+  shell: |
+    # Try to find a bucket with database-related name
+    BUCKET=$(aws s3api list-buckets --region {{ json_vars.ansible.s3.aws_region }} --query 'Buckets[?contains(Name, `backup`) || contains(Name, `dump`) || contains(Name, `database`) || contains(Name, `db`)].Name' --output text | head -n1)
+    if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+      # Fallback to first available bucket
+      BUCKET=$(aws s3api list-buckets --region {{ json_vars.ansible.s3.aws_region }} --query 'Buckets[0].Name' --output text)
+    fi
+    echo "$BUCKET"
+  register: s3_bucket_result
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+  failed_when: s3_bucket_result.stdout == "" or s3_bucket_result.stdout == "None"
+
+- name: Set bucket name
+  set_fact:
+    bucket_name: "{{ s3_bucket_result.stdout }}"
+
+- name: Find database dump file in bucket
+  shell: |
+    # List files and find dump files (added .gz for compressed files)
+    aws s3 ls s3://{{ bucket_name }}/ --region {{ json_vars.ansible.s3.aws_region }} | grep -E '\.(dump|sql|backup|gz)$' | head -n1 | awk '{print $4}'
+  register: dump_file_result
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+  failed_when: dump_file_result.stdout == ""
+
+- name: Set dump file name
+  set_fact:
+    dump_filename: "{{ dump_file_result.stdout }}"
+
+- name: Display found dump file
+  debug:
+    msg: "Found dump file: {{ dump_filename }}"
+
+- name: Create backup directory
+  file:
+    path: "/home/{{ json_vars.ansible.backend.backend_user }}/db_backup"
+    state: directory
+    owner: "{{ json_vars.ansible.backend.backend_user }}"
+    group: "{{ json_vars.ansible.backend.backend_user }}"
+    mode: '0755'
+  become: true
+
+- name: Download dump file from S3
+  shell: "aws s3 cp s3://{{ bucket_name }}/{{ dump_filename }} /home/{{ json_vars.ansible.backend.backend_user }}/db_backup/{{ dump_filename }} --region {{ json_vars.ansible.s3.aws_region }}"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+
+- name: Check if file is compressed
+  stat:
+    path: "/home/{{ json_vars.ansible.backend.backend_user }}/db_backup/{{ dump_filename }}"
+  register: dump_file_stat
+
+- name: Decompress dump file if it's gzipped
+  shell: |
+    cd /home/{{ json_vars.ansible.backend.backend_user }}/db_backup/
+    if file {{ dump_filename }} | grep -q "gzip"; then
+      gunzip {{ dump_filename }}
+      echo "{{ dump_filename | regex_replace('\\.gz$', '') }}"
+    else
+      echo "{{ dump_filename }}"
+    fi
+  register: final_dump_filename
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+
+- name: Set final dump filename
+  set_fact:
+    final_dump_file: "{{ final_dump_filename.stdout }}"
+
+- name: Clean carriage returns from dump file
+  shell: |
+    cd /home/{{ json_vars.ansible.backend.backend_user }}/db_backup/
+    tr -d '\r' < {{ final_dump_file }} > {{ final_dump_file }}.fixed
+    mv {{ final_dump_file }}.fixed {{ final_dump_file }}
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+
+# Test database connection before restoration
+- name: Test database connection
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -c "SELECT 1;"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  register: db_connection_test
+  failed_when: db_connection_test.rc != 0
+
+# Create database if it doesn't exist
+- name: Check if target database exists
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='{{ lookup('env', 'DATABASE_TOCKEN') }}';"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  register: db_exists
+  failed_when: false
+
+- name: Create target database if it doesn't exist
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -c "CREATE DATABASE \"{{ lookup('env', 'DATABASE_TOCKEN') }}\";"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  when: db_exists.stdout == ""
+
+# Drop existing connections to the target database (if needed)
+- name: Terminate existing connections to target database
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{{ lookup('env', 'DATABASE_TOCKEN') }}' AND pid <> pg_backend_pid();"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  ignore_errors: yes
+
+# Backup existing database before restoration (optional but recommended)
+- name: Create backup of existing database
+  shell: |
+    pg_dump -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} > /home/{{ json_vars.ansible.backend.backend_user }}/db_backup/pre_restore_backup_$(date +%Y%m%d_%H%M%S).sql
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  ignore_errors: yes
+
+# Option 1: Drop and recreate database (recommended for clean restore)
+- name: Drop existing database
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -c "DROP DATABASE IF EXISTS \"{{ lookup('env', 'DATABASE_TOCKEN') }}\";"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  when: drop_database_before_restore | default(true) | bool
+
+- name: Recreate target database
+  shell: |
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d postgres -c "CREATE DATABASE \"{{ lookup('env', 'DATABASE_TOCKEN') }}\";"
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  when: drop_database_before_restore | default(true) | bool
+
+# Option 2: Clean existing data without dropping database (alternative approach)
+- name: Clean existing database objects
+  shell: |
+    # Generate script to drop all tables, sequences, etc.
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} -t -c "
+    SELECT 'DROP TABLE IF EXISTS \"' || tablename || '\" CASCADE;' 
+    FROM pg_tables 
+    WHERE schemaname = 'public';" > /tmp/drop_tables.sql
+    
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} -t -c "
+    SELECT 'DROP SEQUENCE IF EXISTS \"' || sequence_name || '\" CASCADE;' 
+    FROM information_schema.sequences 
+    WHERE sequence_schema = 'public';" >> /tmp/drop_tables.sql
+    
+    # Execute the drop statements
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} -f /tmp/drop_tables.sql
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  when: not (drop_database_before_restore | default(true) | bool)
+  ignore_errors: yes
+
+- name: Restore database dump
+  shell: |
+    cd /home/{{ json_vars.ansible.backend.backend_user }}/db_backup/
+    # Check if this is a plain SQL dump or custom format
+    if head -n 5 {{ final_dump_file }} | grep -q "PostgreSQL database dump"; then
+      # Plain SQL dump - remove ON_ERROR_STOP for initial restoration, then validate
+      psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} -f {{ final_dump_file }}
+    else
+      # Custom format dump
+      pg_restore -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} --clean --if-exists --verbose {{ final_dump_file }}
+    fi
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  register: restore_result
+  failed_when: false  # Don't fail immediately, check results below
+
+- name: Check restoration success
+  shell: |
+    # Verify that key tables exist and have data
+    psql -h {{ lookup('env', 'ENDPOINT_TOCKEN_POSTGRES') }} -p 5432 -U {{ lookup('env', 'USERNAME_TOCKEN') }} -d {{ lookup('env', 'DATABASE_TOCKEN') }} -c "
+    SELECT 
+      (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public') as table_count,
+      (SELECT COUNT(*) FROM users) as user_count,
+      (SELECT COUNT(*) FROM groups) as group_count;
+    "
+  environment:
+    PGPASSWORD: "{{ lookup('env', 'USERPASSWORD_TOCKEN') }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  register: validation_result
+  failed_when: validation_result.rc != 0
+
+- name: Display restoration result
+  debug:
+    msg: "Database restoration completed successfully"
+  when: restore_result.rc == 0
+
+- name: Cleanup downloaded files (optional)
+  file:
+    path: "/home/{{ json_vars.ansible.backend.backend_user }}/db_backup/{{ item }}"
+    state: absent
+  loop:
+    - "{{ dump_filename }}"
+    - "{{ final_dump_file }}"
+  become_user: "{{ json_vars.ansible.backend.backend_user }}"
+  when: cleanup_files | default(false) | bool

@@ -1,0 +1,41 @@
+# Replace your ansible/group_vars/all.yml content with this:
+
+---
+# Load variables from JSON file
+json_vars: "{{ lookup('file', '../../variables.json') | from_json }}"
+
+# S3 Configuration
+aws_region: "{{ json_vars.ansible.s3.aws_region }}"
+s3_bucket: "{{ json_vars.ansible.s3.s3_bucket }}"
+dest_dir: "{{ json_vars.ansible.s3.dest_dir }}"
+
+backend_s3_path: "{{ json_vars.ansible.s3.backend_s3_path }}"
+frontend_s3_path: "{{ json_vars.ansible.s3.frontend_s3_path }}"
+backend_data_s3_path: "{{ json_vars.ansible.s3.backend_data_s3_path }}"
+
+# Enable debug output if needed
+s3_deployment_debug: "{{ json_vars.ansible.s3.s3_deployment_debug }}"
+
+# SSH Configuration 
+ansible_ssh_common_args: "{{ json_vars.ansible.ssh.ansible_ssh_common_args }}"
+
+# Proxy Configuration
+proxy_user: "{{ json_vars.ansible.proxy.proxy_user }}"
+proxy_config_file: "{{ json_vars.ansible.proxy.proxy_config_file }}"
+
+# Frontend Configuration (NEW)
+frontend_user: "{{ json_vars.ansible.frontend.frontend_user }}"
+frontend_config_file: "{{ json_vars.ansible.frontend.frontend_config_file }}"
+
+# Backend Configuration
+dump_file: "{{ json_vars.ansible.backend.dump_file }}"
+backend_user: "{{ json_vars.ansible.backend.backend_user }}"
+backend_config_file: "{{ json_vars.ansible.backend.backend_config_file }}"
+
+java_package: "{{ json_vars.ansible.backend.java_package }}"
+java_home: "{{ json_vars.ansible.backend.java_home }}"
+configs_path: "{{ json_vars.ansible.backend.configs_path }}"
+tomcat_home: "{{ json_vars.ansible.backend.tomcat_home }}"
+
+tomcat_version: "{{ json_vars.ansible.backend.tomcat_version }}"
+tomcat_download_url: "{{ json_vars.ansible.backend.tomcat_download_url }}"

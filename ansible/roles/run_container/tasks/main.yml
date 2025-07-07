@@ -1,0 +1,35 @@
+---
+# tasks/main.yml for docker_run_container role
+
+- name: Stop and remove existing container (if present)
+  community.docker.docker_container:
+    name: "{{ container_name }}"
+    state: absent
+  register: container_removed_result
+  changed_when: container_removed_result.changed
+
+- name: Pull Docker image (if specified)
+  community.docker.docker_image:
+    name: "{{ image }}"
+    source: pull
+    state: present
+  when: pull_image | bool
+
+- name: Run Docker container
+  community.docker.docker_container:
+    name: "{{ container_name }}"
+    image: "{{ image }}"
+    state: started # Ensures the container is running
+    restart_policy: "{{ restart_policy }}" # e.g., "always", "on-failure"
+    ports: "{{ ports }}" # List of "host_port:container_port"
+    env: "{{ env_vars }}" # Dictionary of environment variables
+    volumes: "{{ volumes }}" # List of "host_path:container_path"
+    network_mode: "{{ network_mode }}" # e.g., "bridge", "host"
+    image_comparison: 'desired-image'
+  register: container_run_result
+  changed_when: container_run_result.changed
+
+- name: Display container status
+  ansible.builtin.debug:
+    msg: "Container '{{ container_name }}' is now running."
+  when: container_run_result.changed or container_run_result.already_present

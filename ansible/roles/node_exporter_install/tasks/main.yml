@@ -1,0 +1,67 @@
+---
+- name: Create Node Exporter group
+  ansible.builtin.group:
+    name: "{{ node_exporter_group }}"
+    system: true
+    state: present
+
+- name: Create Node Exporter user
+  ansible.builtin.user:
+    name: "{{ node_exporter_user }}"
+    group: "{{ node_exporter_group }}"
+    system: true
+    shell: /bin/false
+    create_home: false
+    state: present
+
+- name: Download Node Exporter binary
+  ansible.builtin.get_url:
+    url: "{{ node_exporter_download_url }}"
+    dest: "/tmp/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}.tar.gz"
+    mode: '0644'
+  register: _node_exporter_download
+  # Only download if the version has changed or the file doesn't exist
+  # This makes the task idempotent.
+
+- name: Extract Node Exporter binary
+  ansible.builtin.unarchive:
+    src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}.tar.gz"
+    dest: "/tmp"
+    remote_src: true
+    extra_opts: [--strip-components=1] # Extracts contents directly into /tmp
+  register: _node_exporter_extract
+  when: _node_exporter_download.changed # Only extract if a new version was downloaded
+
+- name: Move Node Exporter binary to install directory
+  ansible.builtin.copy:
+    src: "/tmp/node_exporter"
+    dest: "{{ node_exporter_install_dir }}/node_exporter"
+    owner: "{{ node_exporter_user }}"
+    group: "{{ node_exporter_group }}"
+    mode: '0755'
+    remote_src: true
+  notify: Restart node_exporter # Trigger handler if binary is updated
+
+- name: Clean up downloaded archive and extracted directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}.tar.gz"
+    - "/tmp/node_exporter-{{ node_exporter_version }}.linux-{{ node_exporter_arch }}"
+
+- name: Configure Node Exporter systemd service file
+  ansible.builtin.template:
+    src: node_exporter.service.j2
+    dest: "/etc/systemd/system/node_exporter.service"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd and restart node_exporter
+
+- name: Ensure Node Exporter service is started and enabled
+  ansible.builtin.systemd:
+    name: node_exporter
+    state: started
+    enabled: true
+    daemon_reload: true # Ensures systemd reloads unit files

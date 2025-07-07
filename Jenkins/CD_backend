@@ -1,0 +1,425 @@
+pipeline {
+    agent {
+        label 'my_node' 
+    }
+    
+    parameters {
+        choice(name: 'ENVIRONMENT', choices: ['development', 'staging', 'production'], description: 'Target environment')
+        string(name: 'ECR_TAG', defaultValue: 'latest', description: 'ECR image tag')
+        string(name: 'DOMAIN_TOKEN', defaultValue: 'https://denys-kucher-schedule.xyz/api', description: 'Domain token')
+        choice(name: 'DEPLOYMENT_TARGET', choices: ['all', 'frontend-only', 'backend-only', 'proxy-only'], description: 'What to deploy')
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Test run')
+        string(name: 'DB_SECRET_NAME', defaultValue: '', description: 'Override: Database secret name (auto-discovered if empty)')
+        string(name: 'DB_HOST', defaultValue: '', description: 'Override: Database host')
+        string(name: 'REDIS_HOST', defaultValue: '', description: 'Override: Redis host')
+        string(name: 'BACKEND_PRIVATE_IP', defaultValue: '', description: 'Override: Backend server private IP (auto-discovered if empty)')
+        string(name: 'FRONTEND_PRIVATE_IP', defaultValue: '', description: 'Override: Frontend server private IP (auto-discovered if empty)')
+        string(name: 'BACKEND_PUBLIC_IP', defaultValue: '', description: 'Override: Backend server public IP (auto-discovered if empty)')
+        string(name: 'FRONTEND_PUBLIC_IP', defaultValue: '', description: 'Override: Frontend server public IP (auto-discovered if empty)')
+    }
+    
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_ACCOUNT_ID = '394094767544'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO_FRONTEND = 'frontend-app'
+        ECR_REPO_BACKEND = 'backend-app'
+        ANSIBLE_HOST_KEY_CHECKING = 'False'
+        PROJECT_PATH = '/home/denys/Downloads/product6_with_docker1'
+        DOMAIN_TOKEN = "${params.DOMAIN_TOKEN}"
+    }
+    
+    stages {
+        stage('Test AWS Access') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ],
+                ]) {
+                    script {
+                        try {
+                            def awsIdentity = sh(
+                                script: 'aws sts get-caller-identity --region $AWS_REGION --output json',
+                                returnStdout: true
+                            ).trim()
+                            
+                            def secretsTest = sh(
+                                script: 'aws secretsmanager list-secrets --region $AWS_REGION --max-items 1 --output text 2>/dev/null || echo "ERROR"',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (secretsTest.contains("ERROR")) {
+                                error "Cannot access AWS Secrets Manager! Check permissions."
+                            }
+                            
+                            def ec2Test = sh(
+                                script: 'aws ec2 describe-instances --region $AWS_REGION --max-items 1 --output text 2>/dev/null || echo "ERROR"',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (ec2Test.contains("ERROR")) {
+                                echo "Limited EC2 access - IP auto-discovery may fail"
+                            }
+                            
+                        } catch (Exception e) {
+                            error """
+                            AWS access failed!
+                            
+                            Error: ${e.getMessage()}
+                            
+                            Please check:
+                            1. Jenkins AWS credentials are correctly configured
+                            2. Credentials have required permissions:
+                               - secretsmanager:ListSecrets
+                               - secretsmanager:GetSecretValue
+                               - rds:DescribeDBInstances
+                               - rds:DescribeDBClusters
+                               - elasticache:DescribeCacheClusters
+                               - ec2:DescribeInstances (for IP discovery)
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Discover Infrastructure') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ],
+                ]) {
+                    script {
+                        def backendPrivateIp = params.BACKEND_PRIVATE_IP
+                        if (!backendPrivateIp) {
+                            backendPrivateIp = sh(
+                                script: '''
+                                    BACKEND_IP=$(aws ec2 describe-instances --region $AWS_REGION \
+                                        --filters "Name=instance-state-name,Values=running" \
+                                        --query 'Reservations[].Instances[?Tags[?Key==`Name` && (contains(Value, `backend`) || contains(Value, `Backend`) || contains(Value, `api`))]].PrivateIpAddress' \
+                                        --output text 2>/dev/null | head -n1)
+                                    
+                                    if [ -n "$BACKEND_IP" ] && [ "$BACKEND_IP" != "None" ]; then
+                                        echo "$BACKEND_IP"
+                                    else
+                                        aws ec2 describe-instances --region $AWS_REGION \
+                                            --filters "Name=instance-state-name,Values=running" \
+                                            --query 'Reservations[].Instances[?SecurityGroups[?contains(GroupName, `backend`) || contains(GroupName, `Backend`)]].PrivateIpAddress' \
+                                            --output text 2>/dev/null | head -n1 || echo ""
+                                    fi
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (backendPrivateIp) {
+                                echo "Auto-discovered backend IP: ${backendPrivateIp}"
+                            }
+                        }
+                        
+                        def frontendPrivateIp = params.FRONTEND_PRIVATE_IP
+                        if (!frontendPrivateIp) {
+                            frontendPrivateIp = sh(
+                                script: '''
+                                    FRONTEND_IP=$(aws ec2 describe-instances --region $AWS_REGION \
+                                        --filters "Name=instance-state-name,Values=running" \
+                                        --query 'Reservations[].Instances[?Tags[?Key==`Name` && (contains(Value, `frontend`) || contains(Value, `Frontend`) || contains(Value, `web`))]].PrivateIpAddress' \
+                                        --output text 2>/dev/null | head -n1)
+                                    
+                                    if [ -n "$FRONTEND_IP" ] && [ "$FRONTEND_IP" != "None" ]; then
+                                        echo "$FRONTEND_IP"
+                                    else
+                                        aws ec2 describe-instances --region $AWS_REGION \
+                                            --filters "Name=instance-state-name,Values=running" \
+                                            --query 'Reservations[].Instances[?SecurityGroups[?contains(GroupName, `frontend`) || contains(GroupName, `Frontend`)]].PrivateIpAddress' \
+                                            --output text 2>/dev/null | head -n1 || echo ""
+                                    fi
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (frontendPrivateIp) {
+                                echo "Auto-discovered frontend IP: ${frontendPrivateIp}"
+                            }
+                        }
+                        
+                        env.BACKEND_PRIVATE_IP = backendPrivateIp
+                        env.FRONTEND_PRIVATE_IP = frontendPrivateIp
+                        
+                        def missingIps = []
+                        if (params.DEPLOYMENT_TARGET in ['all', 'backend-only'] && !env.BACKEND_PRIVATE_IP) {
+                            missingIps.add("backend")
+                        }
+                        if (params.DEPLOYMENT_TARGET in ['all', 'frontend-only'] && !env.FRONTEND_PRIVATE_IP) {
+                            missingIps.add("frontend")
+                        }
+                        
+                        if (missingIps) {
+                            error """
+                            Missing required private IPs: ${missingIps.join(', ')}
+                            
+                            Private IP discovery failed. Please either:
+                            1. Use BACKEND_PRIVATE_IP and/or FRONTEND_PRIVATE_IP parameters
+                            2. Ensure your EC2 instances have proper tags:
+                               - Name tag containing 'backend', 'Backend', or 'api' for backend servers
+                               - Name tag containing 'frontend', 'Frontend', or 'web' for frontend servers
+                            3. Check AWS credentials have ec2:DescribeInstances permission
+                            
+                            Current deployment target: ${params.DEPLOYMENT_TARGET}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Discover and Retrieve Secrets') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ],
+                ]) {
+                    script {
+                        def allSecrets = sh(
+                            script: 'aws secretsmanager list-secrets --region $AWS_REGION --query "SecretList[].Name" --output text 2>/dev/null || echo ""',
+                            returnStdout: true
+                        ).trim()
+                        
+                        def dbSecretName = params.DB_SECRET_NAME
+                        if (!dbSecretName) {
+                            if (!allSecrets) {
+                                error """
+                                No secrets found in AWS Secrets Manager!
+                                
+                                Please either:
+                                1. Create a secret in AWS Secrets Manager with your database credentials
+                                2. Use the DB_SECRET_NAME parameter to specify an exact secret name
+                                3. Check AWS credentials have SecretsManager:ListSecrets permission
+                                """
+                            }
+                            
+                            dbSecretName = sh(
+                                script: '''
+                                    RESULT=$(echo "''' + allSecrets + '''" | tr '\t' '\n' | grep -iE "(database|db|postgres|rds)" | head -n1)
+                                    if [ -n "$RESULT" ]; then
+                                        echo "$RESULT"
+                                        exit 0
+                                    fi
+                                    
+                                    RESULT=$(echo "''' + allSecrets + '''" | tr '\t' '\n' | grep -E "aws-secret-[0-9]+" | head -n1)
+                                    if [ -n "$RESULT" ]; then
+                                        echo "$RESULT"
+                                        exit 0
+                                    fi
+                                    
+                                    echo "''' + allSecrets + '''" | tr '\t' '\n' | head -n1
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                        }
+                        
+                        if (!dbSecretName) {
+                            error """
+                            No valid secret found!
+                            
+                            Available secrets: ${allSecrets ?: 'None'}
+                            
+                            Please specify DB_SECRET_NAME parameter or create a secret in AWS Secrets Manager.
+                            """
+                        }
+                        
+                        sh """
+                            if ! aws secretsmanager describe-secret --secret-id '${dbSecretName}' --region \$AWS_REGION >/dev/null 2>&1; then
+                                echo "Secret '${dbSecretName}' not found!"
+                                exit 1
+                            fi
+                            
+                            SECRET_JSON=\$(aws secretsmanager get-secret-value --secret-id '${dbSecretName}' --region \$AWS_REGION --query SecretString --output text)
+                            
+                            echo \$SECRET_JSON | jq -r '.db_name // .database_name // .database // empty' > /tmp/db_name.txt
+                            echo \$SECRET_JSON | jq -r '.db_username // .username // .user // empty' > /tmp/db_username.txt
+                            echo \$SECRET_JSON | jq -r '.db_password // .password // empty' > /tmp/db_password.txt
+                            echo \$SECRET_JSON | jq -r '.db_host // .host // .endpoint // empty' > /tmp/db_host.txt
+                        """
+                        
+                        def dbName = sh(script: 'cat /tmp/db_name.txt', returnStdout: true).trim()
+                        def dbUsername = sh(script: 'cat /tmp/db_username.txt', returnStdout: true).trim()
+                        def dbPassword = sh(script: 'cat /tmp/db_password.txt', returnStdout: true).trim()
+                        def dbHostFromSecret = sh(script: 'cat /tmp/db_host.txt', returnStdout: true).trim()
+                        
+                        def dbHost = params.DB_HOST ?: dbHostFromSecret
+                        if (!dbHost) {
+                            dbHost = sh(
+                                script: '''
+                                    aws rds describe-db-instances --region $AWS_REGION \
+                                        --query 'DBInstances[?Engine==`postgres`].Endpoint.Address' \
+                                        --output text 2>/dev/null | head -n1 || echo ""
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (!dbHost) {
+                                dbHost = sh(
+                                    script: '''
+                                        aws rds describe-db-clusters --region $AWS_REGION \
+                                            --query 'DBClusters[?Engine==`aurora-postgresql`].Endpoint' \
+                                            --output text 2>/dev/null | head -n1 || echo ""
+                                    ''',
+                                    returnStdout: true
+                                ).trim()
+                            }
+                        }
+                        
+                        def redisHost = params.REDIS_HOST
+                        if (!redisHost || redisHost == "localhost") {
+                            redisHost = sh(
+                                script: '''
+                                    REDIS=$(aws elasticache describe-cache-clusters --region $AWS_REGION \
+                                        --show-cache-node-info \
+                                        --query 'CacheClusters[?Engine==`redis`].CacheNodes[0].Endpoint.Address' \
+                                        --output text 2>/dev/null | head -n1)
+                                    
+                                    if [ -n "$REDIS" ] && [ "$REDIS" != "None" ]; then
+                                        echo "$REDIS"
+                                    else
+                                        aws elasticache describe-replication-groups --region $AWS_REGION \
+                                            --query 'ReplicationGroups[0].PrimaryEndpoint.Address' \
+                                            --output text 2>/dev/null | head -n1 || echo "localhost"
+                                    fi
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                        }
+                        
+                        env.DATABASE_TOCKEN = dbName
+                        env.USERNAME_TOCKEN = dbUsername
+                        env.USERPASSWORD_TOCKEN = dbPassword
+                        env.ENDPOINT_TOCKEN_POSTGRES = dbHost
+                        env.ENDPOINT_TOCKEN_REDIS = redisHost
+                        env.DISCOVERED_SECRET_NAME = dbSecretName
+                        
+                        def missing = []
+                        if (!env.DATABASE_TOCKEN) missing.add("db_name")
+                        if (!env.USERNAME_TOCKEN) missing.add("db_username")
+                        if (!env.USERPASSWORD_TOCKEN) missing.add("db_password")
+                        if (!env.ENDPOINT_TOCKEN_POSTGRES) missing.add("db_host")
+                        
+                        if (missing) {
+                            error """
+                            Missing required fields: ${missing.join(', ')}
+                            
+                            Secret '${dbSecretName}':
+                            - db_name: ${env.DATABASE_TOCKEN ? 'OK' : 'Missing'}
+                            - db_username: ${env.USERNAME_TOCKEN ? 'OK' : 'Missing'}
+                            - db_password: ${env.USERPASSWORD_TOCKEN ? 'OK' : 'Missing'}
+                            - db_host: ${env.ENDPOINT_TOCKEN_POSTGRES ? 'OK' : 'Missing (auto-discovery failed)'}
+                            
+                            Your secret should contain JSON like:
+                            {
+                                "db_name": "mydb",
+                                "db_username": "postgres",
+                                "db_password": "postgres123",
+                                "db_host": "your-host.rds.amazonaws.com" (optional - can be auto-discovered)
+                            }
+                            
+                            Use DB_HOST parameter if auto-discovery fails.
+                            """
+                        }
+                        
+                        sh 'rm -f /tmp/db_*.txt'
+                    }
+                }
+            }
+        }
+ 
+        stage('Deploy') {
+            steps {
+                withCredentials([
+                    [
+                        $class: 'AmazonWebServicesCredentialsBinding',
+                        credentialsId: 'aws-ecr-credentials',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ],
+                ]) {
+                    dir("${env.PROJECT_PATH}/ansible") {
+                        sh '''
+                            if [ -d "venv" ]; then
+                                . venv/bin/activate
+                            fi
+                            
+                            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+                            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+                            export aws_account_id="$AWS_ACCOUNT_ID"
+                            export ecr_image_tag="$ECR_TAG"
+                            export ECR_REPO_FRONTEND="$ECR_REPO_FRONTEND"
+                            export ECR_REPO_BACKEND="$ECR_REPO_BACKEND"
+                            export DOMAIN_TOKEN="$DOMAIN_TOKEN"
+                            export AWS_REGION="$AWS_REGION"
+                            export DATABASE_TOCKEN="$DATABASE_TOCKEN"
+                            export USERNAME_TOCKEN="$USERNAME_TOCKEN"
+                            export USERPASSWORD_TOCKEN="$USERPASSWORD_TOCKEN"
+                            export ENDPOINT_TOCKEN_POSTGRES="$ENDPOINT_TOCKEN_POSTGRES"
+                            export ENDPOINT_TOCKEN_REDIS="$ENDPOINT_TOCKEN_REDIS"
+                            export BACKEND_PRIVATE_IP="$BACKEND_PRIVATE_IP"
+                            export FRONTEND_PRIVATE_IP="$FRONTEND_PRIVATE_IP"
+                            export BACKEND_PUBLIC_IP="$BACKEND_PUBLIC_IP"
+                            export FRONTEND_PUBLIC_IP="$FRONTEND_PUBLIC_IP"
+                            
+                            ANSIBLE_CMD="ansible-playbook -i inventory.ini playbooks/backend.yml -v"
+                            
+                            if [ "$DRY_RUN" = "true" ]; then
+                                ANSIBLE_CMD="$ANSIBLE_CMD --check"
+                                echo "DRY RUN MODE"
+                            fi
+                            
+                            case "${DEPLOYMENT_TARGET}" in
+                                "frontend-only") 
+                                    ANSIBLE_CMD="$ANSIBLE_CMD --limit frontend"
+                                    echo "Deploying: Frontend"
+                                    ;;
+                                "backend-only") 
+                                    ANSIBLE_CMD="$ANSIBLE_CMD --limit backend"
+                                    echo "Deploying: Backend"
+                                    ;;
+                                "proxy-only") 
+                                    ANSIBLE_CMD="$ANSIBLE_CMD --limit proxy"
+                                    echo "Deploying: Proxy"
+                                    ;;
+                                *)
+                                    echo "Deploying: All components"
+                                    ;;
+                            esac
+                            
+                            $ANSIBLE_CMD
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                env.USERPASSWORD_TOCKEN = null
+                env.USERNAME_TOCKEN = null
+                env.BACKEND_PRIVATE_IP = null
+                env.FRONTEND_PRIVATE_IP = null
+                env.BACKEND_PUBLIC_IP = null
+                env.FRONTEND_PUBLIC_IP = null
+            }
+        }
+    }
+}

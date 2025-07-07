@@ -1,0 +1,22 @@
+---
+# These vars are loaded from your variables.json via group_vars/all.yml
+# The json_vars structure is already loaded in all.yml
+
+# User Configuration
+frontend_user: "{{ json_vars.ansible.frontend.frontend_user }}"
+frontend_config_file: "{{ json_vars.ansible.frontend.frontend_config_file }}"
+
+# ECR Configuration (set via environment variables)
+ecr_repository: "{{ lookup('env', 'ECR_REPO_FRONTEND') | default('frontend-app') }}"
+ecr_tag: "{{ lookup('env', 'ecr_image_tag') | default('latest') }}"
+aws_account_id: "{{ lookup('env', 'aws_account_id') }}"
+
+# Container settings
+container_name: "frontend-container"
+host_port: 3000
+container_port: 3000
+restart_policy: "unless-stopped"
+memory_limit: "512m"
+
+# Application environment
+node_env: "{{ json_vars.global.environment | default('production') }}"

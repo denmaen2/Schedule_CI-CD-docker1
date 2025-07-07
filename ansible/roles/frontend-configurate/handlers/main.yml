@@ -1,0 +1,19 @@
+---
+- name: restart frontend container
+  docker_container:
+    name: "{{ container_name }}"
+    state: started
+    restart: yes
+  become: yes
+
+- name: stop frontend container
+  docker_container:
+    name: "{{ container_name }}"
+    state: stopped
+  become: yes
+
+- name: remove frontend container
+  docker_container:
+    name: "{{ container_name }}"
+    state: absent
+  become: yes

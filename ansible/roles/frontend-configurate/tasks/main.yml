@@ -1,0 +1,46 @@
+---
+- name: Read frontend configuration file
+  slurp:
+    src: "/home/{{ frontend_user }}/{{ frontend_config_file }}"
+  register: frontend_config
+  when: frontend_config_file is defined
+
+- name: Login to ECR using AWS CLI
+  shell: |
+    aws ecr get-login-password --region {{ aws_region }} | docker login --username AWS --password-stdin {{ ecr_registry }}
+  args:
+    executable: /bin/bash
+  become: true
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+
+- name: Pull frontend image from ECR
+  docker_image:
+    name: "{{ ecr_registry }}/{{ ecr_repository }}:{{ ecr_tag }}"
+    source: pull
+    force_source: yes
+  become: true
+
+- name: Set container environment variables
+  set_fact:
+    container_env:
+      DOMAIN_TOCKEN: "{{ domain_token }}"
+
+- name: Run frontend Docker container
+  docker_container:
+    name: "{{ container_name }}"
+    image: "{{ ecr_registry }}/{{ ecr_repository }}:{{ ecr_tag }}"
+    state: started
+    restart_policy: "{{ restart_policy }}"
+    published_ports:
+      - "{{ host_port }}:{{ container_port }}"
+    env: "{{ container_env }}"
+    memory: "{{ memory_limit | default('512m') }}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:{{ container_port }}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+  become: true

@@ -1,0 +1,40 @@
+# defaults/main.yml
+---
+prometheus_version: "2.46.0" # Always check for the latest stable version
+prometheus_arch: "amd64" # "amd64" or "arm64"
+prometheus_os: "linux" # Usually "linux"
+prometheus_user: "prometheus"
+prometheus_group: "prometheus"
+prometheus_install_dir: "/usr/local/bin"
+prometheus_config_dir: "/etc/prometheus"
+prometheus_data_dir: "/var/lib/prometheus"
+prometheus_web_listen_address: "0.0.0.0:9090"
+prometheus_scrape_interval: "15s"
+prometheus_evaluation_interval: "15s"
+prometheus_retention_time: "15d" # How long to keep data, e.g., 15 days
+prometheus_log_level: "info"
+
+# URL for downloading Prometheus binary
+prometheus_download_url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.{{ prometheus_os }}-{{ prometheus_arch }}.tar.gz"
+
+# Default scrape configurations (can be a list of dicts)
+# This will be templated into prometheus.yml
+prometheus_scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['localhost:9100'] # Assuming Node Exporter runs on the same host
+
+# Placeholder for additional scrape configs to be merged or replaced
+prometheus_custom_scrape_configs: []
+
+# Placeholder for alert rules (can be a list of dicts or path to files)
+prometheus_alert_rules: []
+
+# Alertmanager configuration (if used)
+prometheus_alertmanager_configs: []
+# - static_configs:
+#     - targets: ['alertmanager_ip:9093']

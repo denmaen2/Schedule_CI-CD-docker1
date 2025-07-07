@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  author: DevOps Team
+  description: Downloads deployment files from S3 using amazon.aws collection
+  license: MIT
+  min_ansible_version: "2.9"
+  
+  platforms:
+    - name: Ubuntu
+      versions:
+        - focal
+        - jammy
+        - noble
+    - name: Amazon
+      versions:
+        - 2
+
+  galaxy_tags:
+    - aws
+    - s3
+    - deployment
+    - ec2
+
+dependencies: []
+
+collections:
+  - amazon.aws

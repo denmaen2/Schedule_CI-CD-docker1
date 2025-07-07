@@ -1,0 +1,55 @@
+---
+# defaults/main.yml for docker_run_container role
+
+# Required: The name for your Docker container.
+# This name will be used to identify and manage the container.
+container_name: "my_app_container"
+image: "nginx:latest"
+ports:
+  - "80:80"
+env_vars: {}
+restart_policy: "always"
+volumes: []
+network_mode: "bridge"
+pull_image: "no"
+container_extra_args: []
+# defaults/main.yml for docker_run_container role
+
+# Required: The name for your Docker container.
+# This name will be used to identify and manage the container.
+# container_name: "my_app_container"
+
+# Required: The Docker image to use for the container.
+# Example: "nginx:latest", "ubuntu:22.04", "myregistry/myimage:1.0"
+# image: "nginx:latest"
+
+# Optional: List of port mappings.
+# Each item should be a string in the format "host_port:container_port".
+# Example: ["80:80", "443:443"]
+# ports:
+#   - "80:80"
+
+# Optional: Dictionary of environment variables to pass to the container.
+# Example: { "DB_HOST": "mydb.example.com", "API_KEY": "your_secret_key" }
+# env_vars: {}
+
+# Optional: Set to 'yes' to ensure the container restarts automatically if it stops.
+# Common values: "no", "on-failure", "always", "unless-stopped"
+# restart_policy: "always"
+
+# Optional: List of volumes to mount into the container.
+# Each item should be a string in the format "host_path:container_path".
+# Example: ["/var/www/html:/usr/share/nginx/html"]
+# volumes: []
+
+# Optional: Network mode for the container.
+# Common values: "bridge", "host", "none", or a custom network name.
+# network_mode: "bridge"
+
+# Optional: Boolean to pull the image even if it exists locally.
+# Set to 'yes' to always ensure the latest image is used.
+# pull_image: "no"
+
+# Optional: List of arguments to pass to the docker run command.
+# Example: ["--log-opt", "max-size=10m"]
+# container_extra_args: []

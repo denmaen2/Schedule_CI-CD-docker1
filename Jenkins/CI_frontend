@@ -1,0 +1,138 @@
+pipeline {
+    agent any
+    
+    environment {
+        BUILD_VERSION = "${env.BUILD_NUMBER}"
+        DOCKER_REGISTRY = 'your-registry.com'
+        FRONTEND_IMAGE = "${DOCKER_REGISTRY}/class-schedule/frontend"
+        
+        // AWS ECR Configuration
+        AWS_REGION = 'us-east-1'
+        ECR_REGISTRY = '394094767544.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_IMAGE = '394094767544.dkr.ecr.us-east-1.amazonaws.com/frontend-app'
+        REACT_APP_API_BASE_URL="DOMAIN_TOCKEN"
+    }
+    
+    tools {
+        git 'Default'
+        nodejs 'NodeJS'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'github-cred', url: 'https://github.com/denmaen2/Schedule_with_docker.git'
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                }
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                dir('frontend/frontend') {
+                    nodejs('NodeJS') {
+                        sh 'npm install'
+                    }
+                }
+            }
+        }
+        
+        stage('Test & Coverage') {
+            steps {
+                dir('frontend/frontend') {
+                    nodejs('NodeJS') {
+                        sh '''
+                            npm test -- --coverage --watchAll=false --testResultsProcessor=jest-junit || true
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    // Publish test results if available
+                    script {
+                        if (fileExists('frontend/frontend/junit.xml')) {
+                            junit testResults: 'frontend/frontend/junit.xml', allowEmptyResults: true
+                        }
+                    }
+                    
+                    // Publish coverage report
+                    publishHTML([
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'frontend/frontend/coverage/lcov-report',
+                        reportFiles: 'index.html',
+                        reportName: 'Frontend Coverage Report'
+                    ])
+                }
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                dir('frontend/frontend') {
+                    nodejs('NodeJS') {
+                        sh 'npm run build'
+                    }
+                }
+            }
+        }
+        
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    docker build -t ${FRONTEND_IMAGE}:${BUILD_VERSION} -f frontend/Dockerfile ./frontend
+                    docker tag ${FRONTEND_IMAGE}:${BUILD_VERSION} ${FRONTEND_IMAGE}:latest
+                    
+                    # Build and tag for ECR
+                    docker build -t ${ECR_IMAGE}:${BUILD_VERSION} -f frontend/Dockerfile ./frontend
+                    docker tag ${ECR_IMAGE}:${BUILD_VERSION} ${ECR_IMAGE}:latest
+                '''
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-ecr-credentials']
+                ]) {
+                    sh '''
+                        # Get ECR login token and login to Docker
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        
+                        # Push images to ECR
+                        docker push ${ECR_IMAGE}:${BUILD_VERSION}
+                        docker push ${ECR_IMAGE}:latest
+                        
+                        echo "Successfully pushed images to ECR:"
+                        echo "- ${ECR_IMAGE}:${BUILD_VERSION}"
+                        echo "- ${ECR_IMAGE}:latest"
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up local Docker images
+            sh '''
+                docker rmi ${ECR_IMAGE}:${BUILD_VERSION} || true
+                docker rmi ${ECR_IMAGE}:latest || true
+                docker rmi ${FRONTEND_IMAGE}:${BUILD_VERSION} || true
+                docker rmi ${FRONTEND_IMAGE}:latest || true
+            '''
+            cleanWs()
+        }
+        
+        success {
+            echo "Pipeline completed successfully! Frontend image pushed to ECR."
+        }
+        
+        failure {
+            echo "Pipeline failed. Check the logs for details."
+        }
+    }
+}

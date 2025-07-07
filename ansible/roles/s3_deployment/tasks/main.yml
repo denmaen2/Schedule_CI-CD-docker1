@@ -1,0 +1,50 @@
+---
+- name: Set S3 keys for backend host
+  set_fact:
+    s3_keys:
+      - "{{ backend_s3_path }}"
+      - "{{ backend_data_s3_path }}"
+  when: "'backend' in group_names"
+
+- name: Set S3 keys for frontend host
+  set_fact:
+    s3_keys:
+      - "{{ frontend_s3_path }}"
+  when: "'frontend' in group_names"
+         
+- name: Debug S3 configuration
+  debug:
+    msg:
+      - "Host: {{ inventory_hostname }}"
+      - "Groups: {{ group_names }}"
+      - "S3 Keys: {{ s3_keys }}"
+      - "S3 Bucket: {{ s3_bucket }}"
+      - "Destination dir: {{ dest_dir }}"
+      - "Files to download: {{ s3_keys | map('basename') | list }}"  # Apply basename to each item
+  when: 
+    - s3_keys is defined
+    - s3_keys is not none
+    - s3_deployment_debug | default(false)
+
+- name: Download archive from S3 to remote EC2 instance
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket }}"
+    object: "{{ item }}"
+    dest: "{{ dest_dir }}/{{ item | basename }}"
+    mode: get
+    region: "{{ aws_region }}"
+  loop: "{{ s3_keys }}"
+  become_user: ubuntu
+  when: 
+    - s3_keys is defined
+    - s3_keys is not none
+  register: s3_download_result
+
+- name: Show download result
+  debug:
+    msg: "Download completed for {{ inventory_hostname }}: {{ s3_keys | map('basename') | list }}"
+  when: 
+    - s3_keys is defined
+    - s3_keys is not none
+    - s3_download_result is defined
+    - s3_deployment_debug | default(false)

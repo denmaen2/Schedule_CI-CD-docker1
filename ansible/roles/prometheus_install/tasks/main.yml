@@ -1,0 +1,94 @@
+# tasks/main.yml
+---
+- name: Create Prometheus group
+  ansible.builtin.group:
+    name: "{{ prometheus_group }}"
+    system: true
+    state: present
+
+- name: Create Prometheus user
+  ansible.builtin.user:
+    name: "{{ prometheus_user }}"
+    group: "{{ prometheus_group }}"
+    system: true
+    shell: "/bin/false"
+    create_home: false
+    state: present
+
+- name: Create Prometheus configuration directory
+  ansible.builtin.file:
+    path: "{{ prometheus_config_dir }}"
+    state: directory
+    owner: "{{ prometheus_user }}"
+    group: "{{ prometheus_group }}"
+    mode: '0755'
+
+- name: Create Prometheus data directory
+  ansible.builtin.file:
+    path: "{{ prometheus_data_dir }}"
+    state: directory
+    owner: "{{ prometheus_user }}"
+    group: "{{ prometheus_group }}"
+    mode: '0755'
+
+- name: Download Prometheus binary
+  ansible.builtin.get_url:
+    url: "{{ prometheus_download_url }}"
+    dest: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+    mode: '0644'
+  register: _prometheus_download_result
+
+- name: Extract Prometheus binary
+  ansible.builtin.unarchive:
+    src: "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+    dest: "/tmp"
+    remote_src: true
+    extra_opts: [--strip-components=1]
+  register: _prometheus_extract_result
+  when: _prometheus_download_result.changed
+
+- name: Copy Prometheus binaries to install directory
+  ansible.builtin.copy:
+    src: "/tmp/{{ item }}"
+    dest: "{{ prometheus_install_dir }}/{{ item }}"
+    owner: "{{ prometheus_user }}"
+    group: "{{ prometheus_group }}"
+    mode: '0755'
+    remote_src: true
+  loop:
+    - prometheus
+    - promtool
+  notify: Restart prometheus # Trigger handler if binaries are updated
+
+- name: Clean up downloaded archive and extracted directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/prometheus-{{ prometheus_version }}.tar.gz"
+    - "/tmp/prometheus-{{ prometheus_version }}.{{ prometheus_os }}-{{ prometheus_arch }}"
+
+- name: Configure Prometheus main configuration file (prometheus.yml)
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ prometheus_config_dir }}/prometheus.yml"
+    owner: "{{ prometheus_user }}"
+    group: "{{ prometheus_group }}"
+    mode: '0644'
+  notify: Reload prometheus config and restart
+
+- name: Configure Prometheus systemd service file
+  ansible.builtin.template:
+    src: prometheus.service.j2
+    dest: "/etc/systemd/system/prometheus.service"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload prometheus config and restart
+
+- name: Ensure Prometheus service is started and enabled
+  ansible.builtin.systemd:
+    name: prometheus
+    state: started
+    enabled: true
+    daemon_reload: true

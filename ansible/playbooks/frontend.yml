@@ -1,0 +1,67 @@
+---
+- name: update cache
+  hosts: frontend
+  become: yes
+  roles:
+    - apt-cache
+
+- name: AWS_CLI 
+  hosts: frontend
+  become: yes
+  roles:
+    - role: awscli
+
+- name: Configure frontend with Docker
+  hosts: frontend
+  become: yes
+  vars:
+    # Set domain token from your secret or variables
+    domain_token: "{{ lookup('env', 'DOMAIN_TOKEN') | default('your-default-token') }}"
+    # Override defaults if needed
+    ecr_tag: "{{ lookup('env', 'ecr_image_tag') | default('latest') }}"
+    aws_account_id: "{{ lookup('env', 'aws_account_id') }}"
+  roles:
+    - role: frontend-configurate
+- name: Monitor
+  hosts: monitor
+  become: true
+  vars:
+    # IP variables for monitoring configuration
+    frontend_private_ip: "{{ lookup('env', 'FRONTEND_PRIVATE_IP') }}"
+    frontend_public_ip: "{{ lookup('env', 'FRONTEND_PUBLIC_IP') }}"
+    backend_private_ip: "{{ lookup('env', 'BACKEND_PRIVATE_IP') }}"
+    backend_public_ip: "{{ lookup('env', 'BACKEND_PUBLIC_IP') }}"
+  roles:
+    - role: prometheus_install
+      prometheus_version: "2.50.1"
+      prometheus_retention_time: "15d"
+      prometheus_custom_scrape_configs:
+        - job_name: 'frontend_cadvisor'
+          metrics_path: '/metrics'
+          static_configs:
+            - targets: ['{{ frontend_private_ip }}:9150']
+        - job_name: 'frontend_node'
+          metrics_path: '/metrics'
+          static_configs:
+            - targets: ['{{ frontend_private_ip }}:9100']
+    
+- name: Install docker on vm
+  hosts: frontend 
+  become: true
+  roles:
+    - node_exporter_install
+    - role: run_container
+      vars:
+        container_name: cadvisor
+        image: gcr.io/cadvisor/cadvisor:latest
+        pull_image: true
+        restart_policy: always
+        ports:
+          - "9150:8080"
+        env_vars: {}
+        volumes:
+          - "/:/rootfs:ro"
+          - "/var/run:/var/run:ro"
+          - "/sys:/sys:ro"
+          - "/var/lib/docker/:/var/lib/docker:ro"
+        network_mode: bridge

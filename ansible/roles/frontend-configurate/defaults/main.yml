@@ -1,0 +1,24 @@
+---
+# ECR Configuration
+ecr_registry: "{{ aws_account_id }}.dkr.ecr.{{ aws_region }}.amazonaws.com"
+ecr_repository: "frontend-app"
+ecr_tag: "latest"
+aws_region: "us-east-1"
+
+# Container Configuration
+container_name: "frontend-app"
+host_port: 3000
+container_port: 3000
+restart_policy: "unless-stopped"
+memory_limit: "512m"
+
+# Application Configuration
+domain_token: ""
+node_env: "production"
+
+# User Configuration (from your variables.json)
+frontend_user: "{{ ansible.frontend.frontend_user | default('ubuntu') }}"
+frontend_config_file: "{{ ansible.frontend.frontend_config_file | default('frontend_config.sh') }}"
+
+# AWS Account ID (should be set as environment variable or group var)
+aws_account_id: "{{ lookup('env', 'aws_account_id') | default('') }}"
